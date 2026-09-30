@@ -1,3 +1,5 @@
+![Portfolio](https://img.shields.io/badge/Portfolio-black)
+
 # Windows Server OS Upgrade Automation
 
 This project remotely assesses, backs up, starts, monitors, and validates an

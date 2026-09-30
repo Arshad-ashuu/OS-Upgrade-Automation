@@ -24,14 +24,14 @@ foreach ($entry in @(
     @{ StatusJsonPath = '\\server\share\status.json' },
     @{ RemoteStagingPath = 'relative' }, @{ TargetComputer = '..\escape' }
 )) {
-    $argsMap = @{ TargetComputer = 'TargetHost'; SourceFilesPath = 'C:\fixtures' }
+    $argsMap = @{ TargetComputer = 'TestVM'; SourceFilesPath = 'C:\fixtures' }
     foreach ($key in $entry.Keys) { $argsMap[$key] = $entry[$key] }
     $rejected = $false
     try { & $bind @argsMap | Out-Null } catch { $rejected = $true }
     Assert-True $rejected "Invalid parameters rejected: $($entry.Keys -join ', ')"
 }
-Assert-True (& $bind -TargetComputer TargetHost -SourceFilesPath C:\fixtures -MonitorOnly -PollIntervalSeconds 1) 'Fast monitor-only parameters bind'
-Assert-True (& $bind -TargetComputer TargetHost -SourceFilesPath C:\fixtures -PrecheckOnly) 'Assessment-only parameters bind'
+Assert-True (& $bind -TargetComputer TestVM -SourceFilesPath C:\fixtures -MonitorOnly -PollIntervalSeconds 1) 'Fast monitor-only parameters bind'
+Assert-True (& $bind -TargetComputer TestVM -SourceFilesPath C:\fixtures -PrecheckOnly) 'Assessment-only parameters bind'
 
 function Write-Log { param($Message, $Level) }
 function New-CimSessionOption {
@@ -50,7 +50,7 @@ function Get-CimInstance {
     [pscustomobject]@{ BuildNumber = '20348' }
 }
 function Remove-CimSession { param($CimSession, $ErrorAction) $script:removed++ }
-$TargetComputer = 'TargetHost'
+$TargetComputer = 'TestVM'
 $Credential = [pscredential]::new('fixture', (ConvertTo-SecureString 'not-a-real-password' -AsPlainText -Force))
 $script:failCim = $false
 foreach ($transport in @('Http', 'Https', 'HttpsSkipCert')) {
@@ -71,7 +71,7 @@ try { Get-RemoteOperatingSystem | Out-Null } catch { $threw = $true }
 Assert-True ($threw -and $script:removed -eq 1) 'Failed live query propagates and disposes session'
 Assert-True (-not $script:sessionArgs.ContainsKey('Credential')) 'Integrated authentication does not bind null credentials'
 
-function Get-WinRMSessionParams { @{ ComputerName = 'TargetHost' } }
+function Get-WinRMSessionParams { @{ ComputerName = 'TestVM' } }
 function Invoke-Command { param($ComputerName, [switch]$AsJob, $ScriptBlock, $ArgumentList) 'mock-job' }
 function Wait-Job { param($Job, $Timeout) if (-not $script:jobTimeout) { $Job } }
 function Receive-Job { param($Job, $ErrorAction) $script:jobResult }
@@ -98,7 +98,7 @@ function Test-RemoteWinRM { param($ComputerName, $Cred, $TimeoutSec) $script:pro
 function Read-RemoteFileWithTimeout { param($Path, $TimeoutSec, [ref]$ErrorDetail) '{"unexpected":"payload"}' }
 function Invoke-CimMethod { param($CimSession, $Namespace, $ClassName, $MethodName, $Arguments) [pscustomobject]@{ ReturnValue = 2 } }
 $script:jobResult = [pscustomobject]@{ Phase = 3; Status = 'InProgress' }
-$result = Get-UpgradeStatus -ComputerName TargetHost -JsonPath 'D:\status.json'
+$result = Get-UpgradeStatus -ComputerName TestVM -JsonPath 'D:\status.json'
 Assert-True ($result.Source -eq 'WinRM' -and $result.Mode -eq 'ActivePolling' -and -not $result.PingOk) 'Blocked ICMP/SMB/DCOM still permits authenticated WinRM status'
 $script:jobResult = $null
 foreach ($probe in @(
@@ -108,7 +108,7 @@ foreach ($probe in @(
 )) {
     $script:probePing = $probe.Ping
     $script:probeWinRm = $probe.WinRm
-    $result = Get-UpgradeStatus -ComputerName TargetHost -JsonPath 'D:\status.json'
+    $result = Get-UpgradeStatus -ComputerName TestVM -JsonPath 'D:\status.json'
     Assert-True ($result.Mode -eq $probe.Mode -and $result.Status -eq 'Unknown' -and $null -eq $result.Stage) "No fabricated progress when status unavailable ($($probe.Mode))"
 }
 
@@ -172,8 +172,14 @@ $targetAst = [System.Management.Automation.Language.Parser]::ParseFile(
     $targetPath, [ref]$targetTokens, [ref]$targetParseErrors)
 if ($targetParseErrors.Count) { throw ($targetParseErrors -join "`n") }
 $targetText = $targetAst.Extent.Text
+$orchestratorText = $ast.Extent.Text
 $targetParameterNames = @($targetAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
 Assert-True ($targetParameterNames -contains 'PrecheckOnly') 'Target starter exposes PrecheckOnly'
+Assert-True ($targetText -match 'ExpectedDisconnect.+REG_DWORD.+/d 1') 'Event 1074 watcher records an expected disconnect without percentage changes'
+Assert-True ($targetText -match 'monitorScript.+-RebootEvent') 'Event 1074 watcher mirrors its evidence through the shared JSON writer'
+Assert-True ($orchestratorText -match 'ProgressFreshness, ProgressUpdatedAtUtc, ProgressHighWaterPercent') 'WinRM status projection includes progress evidence metadata'
+Assert-True ($orchestratorText -match 'ExpectedDisconnect\s*=\s*Get-UpgradeRegDWord') 'DCOM status projection includes expected-disconnect evidence'
+Assert-True ($orchestratorText -match 'expected reboot disconnect after Event ID 1074') 'Connectivity-gap display distinguishes an expected reboot'
 $targetWriteLog = $targetAst.Find({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and

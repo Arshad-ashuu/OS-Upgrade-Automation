@@ -18,7 +18,7 @@
          the script immediately - nothing below runs.
       3. Non-blocking checks (patch level / VMware Tools / RDS CAL) - these can
          warn-and-terminate (patch level, unless -SkipPatchCheckLab is used) or
-         warn-only (RDS CAL pointer) by design.
+         warn-only (RDS CAL pointer) per the customer's exact ask.
       4. Backup of registry hives, local GPO/SECPOL, and (if applicable) the
          RDS CAL licensing database to a folder on a drive OTHER than C:.
       5. Locate/mount the upgrade ISO and locate setup.exe.
@@ -26,7 +26,7 @@
          the reboot-event watcher, and the retention-based auto-cleanup task.
 
 .NOTES
-    Author       : OS Upgrade Automation
+    Author       : Generated for OS Upgrade Automation (HDFC)
     Requires     : Windows Server 2019/2022, PowerShell 5.1+, run elevated (SYSTEM
                    or local Administrator) on Server B.
     Shared paths : Must stay in sync with Update-UpgradeStatus.ps1 and
@@ -379,7 +379,7 @@ $hardFailures = New-Object System.Collections.Generic.List[string]
 $warnings     = New-Object System.Collections.Generic.List[string]
 $preCheckLog  = @()   # human-readable PASS/FAIL/WARN lines for the dedicated pre-check report
 
-# TASK-COUNT-BASED PERCENTAGE: unlike Stage
+# TASK-COUNT-BASED PERCENTAGE (2026-07-24, customer request): unlike Stage
 # 3's telemetry-based percentage, Stage 1 has no live "how far through am I"
 # signal of its own - but the NUMBER OF DISCRETE CHECKS is a real, countable
 # quantity, so "N of M checks done" is a genuine measurement, not a guess.
@@ -424,7 +424,7 @@ function Add-PreCheckResult {
     # due to a hard failure, which is an accurate reflection of reality.
     $script:precheckStepsDone++
     $pct = [math]::Min(100, [int](100.0 * $script:precheckStepsDone / $totalPrecheckSteps))
-    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "InProgress" -PercentComplete $pct -PercentSource "Measured" -Notes "Check $script:precheckStepsDone/$totalPrecheckSteps complete: $Name ($Result)"
+    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "InProgress" -PercentComplete $pct -PercentSource "Measured" -ProgressFreshness "Milestone" -Notes "Check $script:precheckStepsDone/$totalPrecheckSteps complete: $Name ($Result)"
 }
 
 Write-Log "----- Running mandatory pre-checks -----"
@@ -494,7 +494,7 @@ try {
 
 # --- 2.5 Component store health (DISM ScanHealth) ----------------------------
 # ScanHealth is a fast, read-only pass (unlike /RestoreHealth). BLOCKING on
-# confirmed corruption (fail-closed policy - reverted
+# confirmed corruption (2026-07-28, explicit customer decision - reverted
 # the brief 2026-07-26 WARN-only experiment: genuine component-store
 # corruption is a real, documented root cause of in-place-upgrade failures,
 # unlike e.g. orphaned profiles - so it stops the run just like that check
@@ -526,7 +526,7 @@ if ($SkipDismScanHealthLab) {
 }
 
 # --- 2.5b System file integrity (SFC /scannow) -------------------------------
-# SFC validation complements the DISM ScanHealth check above.
+# Added 2026-07-26 (customer request), alongside DISM ScanHealth above.
 # BLOCKING on confirmed corruption (2026-07-28, same decision/reasoning as
 # DISM above - reverted the brief WARN-only experiment): SFC can both
 # DETECT and (unlike DISM ScanHealth) actually REPAIR corrupt protected
@@ -687,7 +687,7 @@ if ($isoInfo -and (Test-Path $isoInfo.SetupPath)) {
                 # outright with /Quiet when install.wim has multiple
                 # applicable images: MOSETUP_E_NO_MATCHING_INSTALL_IMAGE
                 # (0xC1900215) - confirmed both via Microsoft's own "/ImageIndex"
-                # docs and a lab setuperr.log ("SelectImageIndex:
+                # docs and an actual setuperr.log hit on TestVM1 ("SelectImageIndex:
                 # ... No SkuLib Upgrade edition available... Matching upgrade
                 # edition not found in SkuLib").
                 $script:MatchedImageIndex = $match[0].ImageIndex
@@ -720,14 +720,14 @@ if ($isoInfo -and (Test-Path $isoInfo.SetupPath)) {
                 Write-Log "   Target OS  : $targetOsFriendly (build $($verParts[2]))"
                 Write-Log "===================================================================="
 
-                # Lab validation found that a same-
+                # BUG FOUND & FIXED (2026-08-26, real TestVM2 run): a same-
                 # version repair-install (media build == currently installed
                 # build) passed every existing check - edition/InstallationType
                 # match is satisfied trivially when they're literally the same
                 # OS - and setup.exe launched anyway, wasting ~40 min and
                 # producing an ambiguous SourceBuild==TargetBuild run that later
                 # broke phase detection (see Update-UpgradeStatus.ps1 fix).
-                # Hard-block this because
+                # Explicit customer decision: hard-block this instead, since
                 # this tool is for genuine version upgrades, not repair-installs.
                 if ($verParts.Count -ge 3) {
                     if ([int]$verParts[2] -le [int]$sourceBuildForBanner) {
@@ -783,7 +783,7 @@ try {
 }
 
 # =============================================================================
-# SECTION 2b - WARN-AND-TERMINATE / WARN-ONLY CHECKS
+# SECTION 2b - WARN-AND-TERMINATE / WARN-ONLY CHECKS (customer addendum)
 # =============================================================================
 
 # --- Patch level currency -----------------------------------------------------
@@ -890,7 +890,7 @@ try {
 }
 
 # --- RDS Session Host -> CAL license server pointer (warning-only) ------------
-# Per Microsoft's documented RDS CAL
+# Enhanced 2026-08-26 (customer ask). Per Microsoft's documented RDS CAL
 # version-compatibility rules (learn.microsoft.com/windows-server/remote/
 # remote-desktop-services/rds-client-access-license): a license server can
 # only install/issue CALs for its OWN Windows Server version or an EARLIER
@@ -966,7 +966,7 @@ try {
 # after a domain/local user account was deleted without also cleaning up
 # their local profile via the supported "Delete" button in System Properties
 # > Advanced > User Profiles. Harmless to an in-place upgrade technically,
-# but worth flagging as hygiene through an explicit check.
+# but worth flagging as hygiene, and customer-requested as an explicit check.
 # Deliberately NEVER auto-remediated here - only detected/counted/reported,
 # with a REVIEW-FIRST cleanup script printed for a human to run at their own
 # discretion (removing profile registry data is not something to automate
@@ -995,7 +995,7 @@ try {
         Add-PreCheckResult -Name "Orphaned local user profiles" -Result "PASS" -Detail "No orphaned profile SIDs found under ProfileList."
     } else {
         $summaryText = ($orphanedProfiles | ForEach-Object { "$($_.Sid) [$($_.ProfilePath)]" }) -join "; "
-        # HARD-BLOCKING: see the
+        # HARD-BLOCKING (2026-07-26, explicit customer decision - see the
         # 2026-07-24 WARN-only design and the follow-up clarification
         # confirming this should actually stop the upgrade, not just warn):
         # unlike most other checks in this solution, orphaned profiles are
@@ -1150,7 +1150,7 @@ try {
 }
 
 # DRIFT SELF-CHECK (2026-09-26). $totalPrecheckSteps is a hand-maintained
-# constant feeding an operator-visible percentage, and getting it wrong breaks
+# constant feeding a customer-visible percentage, and getting it wrong breaks
 # nothing - which is exactly why it drifts unnoticed. A check ADDED without
 # bumping it makes Stage 1 hit 100% early and sit there; a check REMOVED, or
 # one that returns without reporting (how the RDS CAL check behaved on every
@@ -1173,7 +1173,7 @@ Write-Log "All hard-fail pre-checks PASSED. Warnings (non-blocking): $($warnings
 foreach ($w in $warnings) { Write-Log "  - $w" "WARN" }
 
 if ($PrecheckOnly) {
-    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "AssessmentPassed" -PercentComplete 100 -PercentSource "Measured" -Notes "PrecheckOnly completed successfully. Backup and setup were skipped by request."
+    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "AssessmentPassed" -PercentComplete 100 -PercentSource "Measured" -ProgressFreshness "Milestone" -Notes "PrecheckOnly completed successfully. Backup and setup were skipped by request."
     Write-Log "PrecheckOnly switch is set: all pre-checks passed. Exiting cleanly without proceeding to backup or setup.exe launch." "PASS"
     return
 }
@@ -1204,7 +1204,7 @@ function Update-BackupProgress {
     param([string]$TaskName)
     $script:backupStepsDone++
     $pct = [math]::Min(100, [int](100.0 * $script:backupStepsDone / $totalBackupSteps))
-    Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "InProgress" -PercentComplete $pct -PercentSource "Measured" -Notes "Task $script:backupStepsDone/$totalBackupSteps complete: $TaskName"
+    Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "InProgress" -PercentComplete $pct -PercentSource "Measured" -ProgressFreshness "Milestone" -Notes "Task $script:backupStepsDone/$totalBackupSteps complete: $TaskName"
 }
 
 try {
@@ -1577,6 +1577,7 @@ try {
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Phase /t REG_DWORD /d 4 /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v PhaseName /t REG_SZ /d `"Safe OS Phase`" /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Status /t REG_SZ /d `"InProgress`" /f"
+        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v ExpectedDisconnect /t REG_DWORD /d 1 /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Notes /t REG_SZ /d `"Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot.`" /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v LastUpdated /t REG_SZ /d `"%date% %time%`" /f"
     )
@@ -1605,6 +1606,10 @@ try {
         $progressLogPath = Join-Path $backupFolder "OSUpgradeProgress.log"
         $regCmds += "echo [%date% %time%] [Stage 3/3: Windows Setup Execution] Phase=4 (Safe OS Phase) Status=InProgress Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot. Percent unchanged from last real Downlevel reading (no telemetry possible in WinPE). >> `"$progressLogPath`""
     }
+    # Keep the direct registry writes first because they are the quickest path
+    # in the narrow pre-shutdown window. Then let the mutex-protected shared
+    # writer mirror ExpectedDisconnect and the carried progress into JSON.
+    $regCmds += "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`" -RebootEvent"
     $rebootAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument ("/c " + ($regCmds -join " && "))
     $eventTriggerClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace "Root/Microsoft/Windows/TaskScheduler"
     $eventTrigger = New-CimInstance -CimClass $eventTriggerClass -ClientOnly
@@ -1662,7 +1667,7 @@ $postRollbackCmd = Join-Path $script:ScriptsDir "setuprollback.cmd"
 # ("OnCancel...Result = 0x800704C7" = ERROR_CANCELLED), aborting the whole
 # upgrade before it ever reaches Safe OS/WinPE - misread by our own phase
 # heuristic as "about to reboot" since $WINDOWS.~BT is left behind with no
-# process running. Confirmed via SetupDiagResults.xml/setuperr.log in a lab run.
+# process running. Confirmed via SetupDiagResults.xml/setuperr.log on TestVM1.
 $setupArgs = @(
     "/Auto", "Upgrade",
     "/Quiet",
@@ -1714,6 +1719,10 @@ try {
         if (Get-Process -Name $setupProcNames -ErrorAction SilentlyContinue) { $launched = $true; break }
     }
     if ($launched) {
+        Set-UpgradeRegistryValue -Name "SetupWasObserved" -Value 1 -Type DWord
+        Set-UpgradeRegistryValue -Name "SetupLastObservedAtUtc" -Value ((Get-Date).ToUniversalTime().ToString("o"))
+        Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 0 -Type DWord
+        Remove-ItemProperty -Path $script:RegRoot -Name "SetupMissingSinceUtc" -ErrorAction SilentlyContinue
         Write-Log "Confirmed setup.exe process is running. This script does NOT wait for the full upgrade - progress is tracked via the '$script:TaskMonitor' scheduled task and $script:StatusJson from here on."
     } else {
         $setupTaskInfo = Get-ScheduledTaskInfo -TaskName $script:TaskSetupRun -ErrorAction SilentlyContinue

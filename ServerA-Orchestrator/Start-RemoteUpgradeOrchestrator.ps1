@@ -10,7 +10,7 @@
     Step 1  - Validate local companion files exist and Server B is currently
               reachable (ping is best-effort only; WinRM is the real gate,
               probed over HTTP/5985 first then automatically over HTTPS/5986).
-    Step 2  - Open a PSSession to Server B, copy the required target-side files into a
+    Step 2  - Open a PSSession to Server B, copy the 5 target-side files into a
               staging folder, and invoke Start-TargetUpgrade.ps1 there. This
               call returns as soon as Server B's pre-checks/backup/mount are
               done and setup.exe has been launched - it does NOT block for the
@@ -73,7 +73,7 @@
     certificate whose CN/SAN matches the exact -TargetComputer value.
 
 .PARAMETER SourceFilesPath
-    Folder on Server A containing the required target-side files. Default: the
+    Folder on Server A containing the 5 target-side files. Default: the
     "..\ServerB-Target" folder next to this script.
 
 .PARAMETER RemoteStagingPath
@@ -138,7 +138,7 @@
 .EXAMPLE
     Target where only the HTTPS WinRM listener (5986) is open, using an
     internally-issued certificate that Server A already trusts:
-    .\Start-RemoteUpgradeOrchestrator.ps1 -TargetComputer "SERVER01" -UseSSL
+    .\Start-RemoteUpgradeOrchestrator.ps1 -TargetComputer "ServerB.contoso.com" -UseSSL
 
 .EXAMPLE
     Same, but the 5986 listener uses a self-signed certificate (accept it
@@ -1123,6 +1123,12 @@ function Get-RemoteStatusViaCimDcom {
                 Status          = Get-UpgradeRegSZ    $cimSession "Status"
                 PercentComplete = Get-UpgradeRegDWord $cimSession "PercentComplete"
                 PercentSource   = Get-UpgradeRegSZ    $cimSession "PercentSource"
+                ProgressFreshness        = Get-UpgradeRegSZ    $cimSession "ProgressFreshness"
+                ProgressUpdatedAtUtc     = Get-UpgradeRegSZ    $cimSession "ProgressUpdatedAtUtc"
+                ProgressHighWaterPercent = Get-UpgradeRegDWord $cimSession "ProgressHighWaterPercent"
+                ProgressHighWaterStage   = Get-UpgradeRegSZ    $cimSession "ProgressHighWaterStage"
+                StatusUpdatedAtUtc        = Get-UpgradeRegSZ    $cimSession "StatusUpdatedAtUtc"
+                ExpectedDisconnect        = Get-UpgradeRegDWord $cimSession "ExpectedDisconnect"
                 SourceBuild     = Get-UpgradeRegSZ    $cimSession "SourceBuild"
                 TargetBuild     = Get-UpgradeRegSZ    $cimSession "TargetBuild"
                 LastUpdated     = Get-UpgradeRegSZ    $cimSession "LastUpdated"
@@ -1167,6 +1173,8 @@ function Get-RemoteStatusViaWinRM {
             }
             Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\OSUpgradeAutomation" |
                 Select-Object Phase, PhaseName, Status, PercentComplete, PercentSource,
+                    ProgressFreshness, ProgressUpdatedAtUtc, ProgressHighWaterPercent,
+                    ProgressHighWaterStage, StatusUpdatedAtUtc, ExpectedDisconnect,
                     SourceBuild, TargetBuild, LastUpdated, Notes, PostUpgradeOSCaption,
                     ServicesComparisonResult, ServicesComparisonReportPath,
                     ServicesAttentionCount, ServicesInfoCount, TargetOSCaption,
@@ -1308,7 +1316,7 @@ function Get-UpgradeStatus {
         # launched (Stage 1/2 never reach this code path at all) - so it's
         # always genuinely Stage 3, even though we can't confirm the exact
         # sub-phase. Wording calls out Safe OS/WinPE by name so it's less
-        # ambiguous to an operator watching the GUI bar than a bare
+        # ambiguous to a customer watching the GUI bar than a bare
         # "heartbeat only" message.
         return [pscustomobject]@{ PingOk = $true; WinRmOk = $false; Mode = "Heartbeat"; Source = "PingOnly"; Status = "Unknown"; PhaseName = "Ping reachable; upgrade phase unconfirmed"; PercentComplete = $null; Notes = "No status channel returned data. Ping alone does not establish upgrade progress."; TargetBuild = $null; Stage = $null }
     }
@@ -1369,7 +1377,7 @@ function Show-ProgressBar {
     param(
         [int]$PercentComplete, [string]$PhaseName, [string]$Status, [bool]$PingOk,
         [string]$Mode, [string]$Source, [string]$PercentSource, [string]$Stage,
-        $Phase, [int]$EvidenceAgeSec = -1
+        $Phase, [int]$EvidenceAgeSec = -1, [int]$ProgressAgeSec = -1
     )
 
     $pct = [math]::Max(0, [math]::Min(100, $PercentComplete))
@@ -1387,11 +1395,12 @@ function Show-ProgressBar {
     $stageText = if ($Stage) { $Stage } else { "Stage -" }
     # Staleness is the signal that distinguishes "working" from "frozen" - the
     # defect that previously let a dead run look healthy for hours.
-    $ageText = if ($EvidenceAgeSec -ge 0) { "target status unchanged for ${EvidenceAgeSec}s" } else { "no target status yet" }
+    $statusAgeText = if ($EvidenceAgeSec -ge 0) { "status ${EvidenceAgeSec}s" } else { "status age n/a" }
+    $progressAgeText = if ($ProgressAgeSec -ge 0) { "progress ${ProgressAgeSec}s" } else { "progress age n/a" }
 
     Write-Progress -Id 1 `
         -Activity "OS upgrade on $TargetComputer   |   $stageText   |   $pingText / $modeText" `
-        -Status   "[$pct% $srcText]  $PhaseName   (Status=$Status, src:$Source, $ageText)" `
+        -Status   "[$pct% $srcText]  $PhaseName   (Status=$Status, src:$Source, $statusAgeText, $progressAgeText)" `
         -CurrentOperation (Get-PhaseChecklist -Phase $Phase) `
         -PercentComplete $pct
 }
@@ -1458,12 +1467,15 @@ $stallWarningCount = 0
 $lastKnownPercent  = 0
 $lastKnownStage = $null
 $lastKnownPercentSource = "Estimated"
+$lastKnownProgressFreshness = $null
+$lastProgressUpdatedAtUtc = $null
+$lastExpectedDisconnect = $false
 # Intelligent "why didn't I see phase X" self-explanation (2026-07-20):
 # tracks the last REAL numeric Phase actually read from a genuine status
 # source (File/CIM-DCOM - the synthetic WinRMOnly/Heartbeat/Offline
 # fallback objects have no Phase number at all, so they never update this).
 # Whenever a new real reading jumps by more than 1 (e.g. 3 -> 6, skipping 4
-# and 5), this proactively explains WHY in plain language - so the operator
+# and 5), this proactively explains WHY in plain language - so the customer
 # never has to ask "where did Safe OS/First Boot go" the way you just did;
 # the tool now says so itself.
 $lastObservedPhaseNum = $null
@@ -1541,10 +1553,15 @@ while ($true) {
         $lastKnownStage = $status.Stage
         $lastKnownPercent       = $freshPct
         $lastKnownPercentSource = if ($status.PercentSource) { $status.PercentSource } else { "Estimated" }
-        $pctSourceForDisplay    = $lastKnownPercentSource
+        if ($status.ProgressFreshness) { $lastKnownProgressFreshness = $status.ProgressFreshness }
+        if ($status.ProgressUpdatedAtUtc) { $lastProgressUpdatedAtUtc = $status.ProgressUpdatedAtUtc }
+        $freshnessForDisplay = if ($lastKnownProgressFreshness) { $lastKnownProgressFreshness } else { "legacy" }
+        $pctSourceForDisplay = "$lastKnownPercentSource/$freshnessForDisplay"
     } else {
-        $pctSourceForDisplay = "$lastKnownPercentSource (cached)"
+        $freshnessForDisplay = if ($lastKnownProgressFreshness) { $lastKnownProgressFreshness } else { "legacy" }
+        $pctSourceForDisplay = "$lastKnownPercentSource/$freshnessForDisplay (cached)"
     }
+    if ($null -ne $status.ExpectedDisconnect) { $lastExpectedDisconnect = [bool][int]$status.ExpectedDisconnect }
     $pct = $lastKnownPercent
     # Same sticky principle as $lastKnownPercent above, applied to the
     # PHASE NAME itself: during a connectivity gap, show the last CONFIRMED
@@ -1552,15 +1569,27 @@ while ($true) {
     # guessed phase as if it were fact - see $lastConfirmedPhaseName above
     # for why that guess has been directly observed to be wrong.
     $lastConfirmedForDisplay = if ($null -ne $lastConfirmedPhaseName) { $lastConfirmedPhaseName } else { "no phase confirmed yet" }
-    $displayPhaseName = if ($null -ne $status.Phase) { $status.PhaseName } else { "$lastConfirmedForDisplay (connectivity gap - phase UNCONFIRMED; could be a Safe OS/WinPE reboot in progress, or just a transient interruption while still in this same phase - next real reading will confirm)" }
+    $displayPhaseName = if ($null -ne $status.Phase) {
+        $status.PhaseName
+    } elseif ($lastExpectedDisconnect) {
+        "$lastConfirmedForDisplay (expected reboot disconnect after Event ID 1074; phase unconfirmed until the target returns)"
+    } else {
+        "$lastConfirmedForDisplay (unexpected connectivity gap - reboot, network interruption, and host failure remain unconfirmed)"
+    }
 
     if ($status.LastUpdated -and $status.LastUpdated -ne $lastStatusStamp) {
         $lastStatusStamp      = $status.LastUpdated
         $lastEvidenceChangeAt = Get-Date
     }
     $evidenceAgeSec = [int]((Get-Date) - $lastEvidenceChangeAt).TotalSeconds
+    $progressAgeSec = -1
+    if ($lastProgressUpdatedAtUtc) {
+        try {
+            $progressAgeSec = [math]::Max(0, [int]((Get-Date).ToUniversalTime() - [datetime]::Parse($lastProgressUpdatedAtUtc).ToUniversalTime()).TotalSeconds)
+        } catch { $progressAgeSec = -1 }
+    }
 
-    Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status -PingOk $status.PingOk -Mode $status.Mode -Source $status.Source -PercentSource $pctSourceForDisplay -Stage $status.Stage -Phase $status.Phase -EvidenceAgeSec $evidenceAgeSec
+    Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status -PingOk $status.PingOk -Mode $status.Mode -Source $status.Source -PercentSource $pctSourceForDisplay -Stage $status.Stage -Phase $status.Phase -EvidenceAgeSec $evidenceAgeSec -ProgressAgeSec $progressAgeSec
 
     # The console bar is ephemeral and is never captured by redirection, so
     # without this the log file ends up with phase transitions but no
@@ -1671,7 +1700,7 @@ while ($true) {
                 # The VERY FIRST real reading ever - there's nothing to
                 # "change" FROM, so an "'X' -> 'Y'" transition framing would
                 # either show a blank/placeholder on the left (confusing -
-                # an operator would rightly ask why it's empty) for what
+                # a customer would rightly ask why it's empty) for what
                 # isn't really a transition at all. State it plainly instead.
                 Write-Log "$(if ($status.Stage) { "[$($status.Stage)] " })First phase detected: '$($status.PhaseName)' (Status=$($status.Status))"
             } else {
@@ -1757,7 +1786,7 @@ $summaryOsCaption      = if ($status.PostUpgradeOSCaption) { $status.PostUpgrade
 $summaryBuild          = if ($targetBuildKnown) { $targetBuildKnown } elseif ($status.TargetBuild) { $status.TargetBuild } else { "(not reported)" }
 $summaryServicesResult = if ($status.ServicesComparisonResult) { $status.ServicesComparisonResult } else { "NotAvailable" }
 $summaryServicesPath   = if ($status.ServicesComparisonReportPath) { $status.ServicesComparisonReportPath } else { "(not available)" }
-# Operator-facing wording is deliberately calibrated to not cause alarm over
+# Customer-facing wording is deliberately calibrated to not cause alarm over
 # expected upgrade churn: an in-place OS upgrade routinely changes dozens of
 # services (new OS-version services appearing, per-user session services
 # re-instantiating under a new suffix, on-demand services simply not
@@ -1790,7 +1819,7 @@ function Write-FinalSummary {
 switch ($finalOutcome) {
     "Completed" {
         Write-FinalSummary -UpgradeStatus "Success"
-        # ARCHITECTURAL NOTE: should this
+        # ARCHITECTURAL NOTE (2026-07-20, customer question: should this
         # wait for/report a distinct "Second Boot completed" step instead
         # of jumping straight to Completed?): deliberately NOT changed.
         # "Completed" fires from Windows Setup's OWN documented /PostOOBE
@@ -1801,7 +1830,7 @@ switch ($finalOutcome) {
         # normal Windows machines do background policy/maintenance work on
         # every boot regardless of whether an upgrade just happened -
         # picking a LATER cutoff would make completion detection LESS
-        # reliable, not more. Instead: tell the operator plainly that
+        # reliable, not more. Instead: just tell the customer plainly that
         # this is expected, so a still-settling console doesn't look like a
         # contradiction of the "Success" verdict just printed.
         Write-Log "Note: the target may still show brief post-completion housekeeping for a few minutes (Group Policy Client processing, one more reboot) - this is normal first-logon Windows behavior, not a sign the upgrade itself is incomplete. Windows Setup's own /PostOOBE hook (Microsoft's own definition of 'upgrade finished') plus a local build-number re-check are what this Success verdict is based on." "INFO"
